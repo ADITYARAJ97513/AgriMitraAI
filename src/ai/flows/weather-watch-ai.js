@@ -1,81 +1,131 @@
 'use server';
 
 /**
- * @fileOverview An AI agent that provides weather alerts and recommendations tailored to specific crops.
- *
- * - getWeatherAlerts - A function that returns weather alerts and recommendations.
+ * @fileOverview An AI agent that provides weather alerts and crop-specific recommendations using OpenRouter.
  */
 
-import {ai} from '@/ai/genkit';
 import { getWeatherForecast } from '@/services/weather';
 import { z } from 'zod';
 
+// ✅ Input Schema
 const GetWeatherAlertsInputSchema = z.object({
   location: z.string().describe("The farmer's location."),
   cropPlanned: z.string().optional().describe("The crop being planned or grown."),
 });
 
+// ✅ Output Schema
 const GetWeatherAlertsOutputSchema = z.object({
-    reportTitle: z.string().describe("The title of the weather report, e.g., 'Weather Forecast for Patna'"),
-    overallSummary: z.string().describe("A brief, human-readable summary of the weather."),
-    recommendations: z.array(z.string()).describe("A list of 2-3 actionable recommendations for the farmer."),
-    motivationalMessage: z.string().describe("A short, encouraging message for the farmer.")
+  reportTitle: z.string().describe("The title of the weather report, e.g., 'Weather Forecast for Patna'"),
+  overallSummary: z.string().describe("A brief, human-readable summary of the weather."),
+  recommendations: z.array(z.string()).describe("A list of 2-3 actionable recommendations for the farmer."),
+  motivationalMessage: z.string().describe("A short, encouraging message for the farmer."),
 });
 
+// ✅ Entry Point
 export async function getWeatherAlerts(input) {
-  if (!process.env.GOOGLE_API_KEY) {
-    return { error: 'Server is missing GOOGLE_API_KEY. Please configure it in the .env file.' };
+  const validation = GetWeatherAlertsInputSchema.safeParse(input);
+  if (!validation.success) {
+    return { error: '❌ Invalid input. Please check the fields.' };
   }
+
+  if (!process.env.OPENROUTER_API_KEY) {
+    return { error: '❌ Missing OPENROUTER_API_KEY in .env file.' };
+  }
+
   try {
     return await weatherWatchFlow(input);
   } catch (e) {
-    console.error(e);
-    return { error: 'An error occurred while communicating with the AI service. Please check the server logs and API key.' };
+    console.error('❌ OpenRouter Weather AI Error:', e);
+    return {
+      error: 'An error occurred while communicating with OpenRouter. Please check logs.',
+    };
   }
 }
 
-const weatherWatchPrompt = ai.definePrompt({
-    name: 'weatherWatchPrompt',
-    model: 'googleai/gemini-1.5-flash-latest',
-    input: { schema: z.object({ 
-        location: z.string(),
-        forecast: z.any(), 
-        cropPlanned: z.string().optional() 
-    }) },
-    output: { schema: GetWeatherAlertsOutputSchema },
-    prompt: `You are an agricultural weather advisor. Based on the following weather forecast data for a farmer, provide a helpful report.
+// ✅ OpenRouter Flow with Fallback for Small Towns
+const weatherWatchFlow = async ({ location, cropPlanned }) => {
+  const normalizedLocation = location.trim().toLowerCase().replace(/\s+/g, ' ');
+  const forecast = await getWeatherForecast(normalizedLocation || 'default');
 
-    Location: {{{location}}}
-    Crop Planned: {{{cropPlanned}}}
-
-    Weather Forecast Data:
-    - Summary: {{{forecast.summary}}}
-    - Temperature: {{{forecast.temperature}}}°C
-    - Precipitation: {{{forecast.precipitation}}}
-    - Wind Speed: {{{forecast.windSpeed}}} km/h
-    - Humidity: {{{forecast.humidity}}}%
-
-    Your tasks:
-    1.  Create a 'reportTitle' for the farmer's location.
-    2.  Write an 'overallSummary' of the weather conditions in simple terms.
-    3.  Generate a list of 2-3 actionable 'recommendations'. If a crop is mentioned, tailor the advice for that crop (e.g., "For your tomato crop, ensure adequate irrigation due to high heat."). If there are no immediate threats, a recommendation could be "Weather seems favorable for normal operations."
-    4.  Provide a short 'motivationalMessage'.
-    `,
-});
-
-const weatherWatchFlow = ai.defineFlow(
-  {
-    name: 'weatherWatchFlow',
-    inputSchema: GetWeatherAlertsInputSchema,
-    outputSchema: GetWeatherAlertsOutputSchema,
-  },
-  async ({location, cropPlanned}) => {
-    // Step 1: Get the raw weather data from the service.
-    const forecast = await getWeatherForecast(location || "default");
-    
-    // Step 2: Pass the data to the AI to generate intelligent recommendations.
-    const { output } = await weatherWatchPrompt({ location, forecast, cropPlanned });
-
-    return output;
+  // ⛔ Fallback for unavailable data
+  if (!forecast || !forecast.summary) {
+    return {
+      reportTitle: `Weather Report for ${location}`,
+      overallSummary: `Sorry, weather data for "${location}" could not be fetched.`,
+      recommendations: [
+        '✅ Try entering a nearby city or district name.',
+        '✅ Check spelling and avoid local town nicknames.',
+      ],
+      motivationalMessage: 'Keep going! Nature rewards the patient.',
+    };
   }
-);
+
+  const prompt = `
+You are an agricultural weather advisor in India. A farmer at "${location}" is growing ${cropPlanned || "a crop"}.
+
+Here is their local weather forecast:
+- Summary: ${forecast.summary}
+- Temperature: ${forecast.temperature}°C
+- Precipitation: ${forecast.precipitation}
+- Wind Speed: ${forecast.windSpeed} km/h
+- Humidity: ${forecast.humidity}%
+
+Tasks:
+1. Write a report title like "Weather Forecast for Patna".
+2. Give a clear summary of the weather (rain, heat, storms, etc.).
+3. List 2-3 simple recommendations tailored to the crop (or general if no crop is provided).
+4. Add a motivational message for the farmer.
+
+Respond in **this exact JSON** format:
+
+{
+  "reportTitle": "...",
+  "overallSummary": "...",
+  "recommendations": ["...", "..."],
+  "motivationalMessage": "..."
+}
+`;
+
+  const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: 'mistralai/mistral-7b-instruct',
+      messages: [
+        {
+          role: 'system',
+          content: 'You are a friendly agricultural weather assistant.',
+        },
+        {
+          role: 'user',
+          content: prompt,
+        },
+      ],
+    }),
+  });
+
+  const raw = await res.text();
+  console.log('🔍 OpenRouter Weather Raw Response:', raw);
+
+  if (!res.ok) {
+    throw new Error(`OpenRouter API returned status ${res.status}`);
+  }
+
+  try {
+    const parsed = JSON.parse(raw);
+    const content = parsed.choices?.[0]?.message?.content ?? '{}';
+    const final = JSON.parse(content);
+    return GetWeatherAlertsOutputSchema.parse(final);
+  } catch (err) {
+    console.error('❌ Failed to parse weather response:', err);
+    return {
+      reportTitle: 'Weather Report Unavailable',
+      overallSummary: 'Could not interpret forecast data.',
+      recommendations: [],
+      motivationalMessage: '',
+    };
+  }
+};
